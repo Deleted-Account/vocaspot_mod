@@ -274,7 +274,10 @@ async function scanArticle(articleNode) {
 // ---------------------------------------------------------------------------
 
 const CEFR_ORDER = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
-const MAX_HIGHLIGHTS = 20;
+
+// Raised from 20 to 100: the old cap was too conservative and caused large
+// portions of an article to go un-highlighted even on the initial scan.
+const MAX_HIGHLIGHTS = 500;
 
 const COMMON_WORDS_BLACKLIST = new Set([
   'found', 'known', 'united', 'remains',
@@ -300,7 +303,7 @@ function getPosRank(word) {
 }
 
 /**
- * Returns words whose cefrLevel exactly matches targetLevel, capped at MAX_HIGHLIGHTS.
+ * Returns words at or above targetLevel in the CEFR scale, capped at MAX_HIGHLIGHTS.
  * When the cap applies, nouns are kept first, then verbs, then adjectives, then others.
  *
  * @param {Array<{word, lemma, cefrLevel, textNode, offset}>} words
@@ -313,8 +316,9 @@ function filterByUserLevel(words, targetLevel) {
     return [];
   }
 
+  const targetIndex = CEFR_ORDER.indexOf(targetLevel);
   const candidates = words.filter(w =>
-    w.cefrLevel === targetLevel && !COMMON_WORDS_BLACKLIST.has(w.lemma)
+    CEFR_ORDER.indexOf(w.cefrLevel) >= targetIndex && !COMMON_WORDS_BLACKLIST.has(w.lemma)
   );
 
   if (candidates.length <= MAX_HIGHLIGHTS) return candidates;
@@ -374,11 +378,43 @@ async function main() {
     highlightWords(filtered, highlightStyle);
     init();
 
-    // Watch for large DOM mutations that indicate a SPA navigated to a new article
-    // (e.g. BBC, Guardian). Disconnect any previous observer first so we don't
-    // accumulate listeners across re-scans.
+    // ---------------------------------------------------------------------------
+    // DOM mutation observer — two distinct response paths:
+    //
+    //  PATH A — Lazy-load / infinite scroll (small bursts of new content):
+    //    New text between LAZY_LOAD_MIN_CHARS and SPA_THRESHOLD chars is treated
+    //    as content the page appended without navigating. We re-scan just the
+    //    article body and highlight any words not already marked, preserving all
+    //    existing highlights. This covers BBC "load more", Guardian infinite
+    //    scroll, CNN lazy paragraphs, etc.
+    //
+    //  PATH B — SPA navigation (large content swap):
+    //    New text above SPA_THRESHOLD chars strongly suggests the page replaced
+    //    its main content entirely (e.g. client-side routing on BBC or Guardian).
+    //    We tear down all existing highlights and run main() from scratch so the
+    //    new article gets a clean scan.
+    //
+    // Mutations originating from VocaSpot's own DOM writes (highlight spans,
+    // tooltip, sidebar, lookup button) are filtered out before either path runs
+    // so we never react to our own output.
+    // ---------------------------------------------------------------------------
+
+    // Minimum new-character count that qualifies as lazy-loaded content worth
+    // scanning. Below this we assume it's a UI tweak (e.g. ad refresh, cookie
+    // banner update) and do nothing.
+    const LAZY_LOAD_MIN_CHARS = 80;
+
+    // Above this threshold we assume the page navigated to a new article and
+    // trigger a full rescan (PATH B) instead of an incremental one (PATH A).
+    const SPA_THRESHOLD = 1500;
+
+    // Disconnect any previous observer before registering a new one so we don't
+    // accumulate listeners across re-scans triggered by PATH B.
     if (_spaObserver) _spaObserver.disconnect();
+
+    // PATH B: full rescan, debounced to coalesce rapid SPA mutations.
     const _debouncedRescan = debounce(async () => {
+      if (DEBUG) console.log('[VocaSpot] SPA navigation detected — running full rescan');
       for (const span of document.querySelectorAll('.vs-highlight')) {
         span.replaceWith(document.createTextNode(span.textContent));
       }
@@ -386,18 +422,55 @@ async function main() {
       await main();
     }, 1500);
 
+    // PATH A: incremental highlight for lazy-loaded nodes, debounced to batch
+    // multiple rapid mutations (e.g. several paragraphs appended in quick
+    // succession) into a single scan pass.
+    const _debouncedLazyHighlight = debounce(async () => {
+      if (DEBUG) console.log('[VocaSpot] Lazy-load content detected — running incremental highlight');
+
+      const currentArticleNode = findArticleBody();
+      if (!currentArticleNode) return;
+
+      let newWords;
+      try {
+        newWords = await scanArticle(currentArticleNode);
+      } catch (err) {
+        console.warn('[VocaSpot] lazy highlight: word scan could not complete:', err);
+        return;
+      }
+
+      const { targetLevel: currentLevel = 'B2', highlightStyle: currentStyle = 'underline-dashed' } =
+        await chrome.storage.sync.get({ targetLevel: 'B2', highlightStyle: 'underline-dashed' });
+
+      const filtered = filterByUserLevel(newWords, currentLevel);
+
+      // Only pass words whose text node has not already been wrapped in a
+      // highlight span — scanArticle returns the original text nodes, so if a
+      // word was highlighted in a previous pass its textNode will have been
+      // split and the parent will be a .vs-highlight span.
+      const unhighlighted = filtered.filter(
+        w => !w.textNode.parentElement?.closest('.vs-highlight')
+      );
+
+      if (unhighlighted.length === 0) return;
+      if (DEBUG) console.log(`[VocaSpot] lazy highlight: ${unhighlighted.length} new word(s) to add`);
+      highlightWords(unhighlighted, currentStyle);
+    }, 600);
+
     _spaObserver = new MutationObserver((mutations) => {
-      // Exclude mutations that originated inside #vs-tooltip. When showTooltip()
-      // writes the context sentence + definition into the tooltip's child elements,
-      // those childList mutations land here (the tooltip is a direct child of
-      // document.body). Without this filter the accumulated text length regularly
-      // exceeds 200 chars and incorrectly schedules a rescan, so hideTooltip()
-      // fires ~1500 ms later. Manual-lookup tooltips escaped this only because
-      // they omit the context sentence, keeping the char count under the threshold.
-      const pageMutations = mutations.filter(m => !m.target.closest?.('#vs-tooltip'));
+      // Filter out mutations that originated inside VocaSpot's own UI elements:
+      // tooltip child updates, sidebar content writes, and lookup button inserts
+      // all fire mutations on document.body subtree. Without this guard the
+      // tooltip context-sentence write alone regularly exceeds LAZY_LOAD_MIN_CHARS
+      // and would incorrectly trigger a lazy-highlight pass on every word click.
+      const pageMutations = mutations.filter(m =>
+        !m.target.closest?.('#vs-tooltip') &&
+        !m.target.closest?.('#vs-sidebar-host') &&
+        !m.target.closest?.('#vs-lookup-btn')
+      );
       if (pageMutations.length === 0) return;
 
-      // Ignore mutations caused by our own highlight insertions or UI elements.
+      // Ignore mutations caused by our own highlight span insertions.
       for (const m of pageMutations) {
         for (const node of m.addedNodes) {
           if (node.nodeType !== Node.ELEMENT_NODE) continue;
@@ -405,16 +478,26 @@ async function main() {
           if (typeof node.id === 'string' && node.id.startsWith('vs-')) return;
         }
       }
-      // Only re-scan when a meaningful amount of new text was added.
+
+      // Count the total new text characters across all relevant mutations.
       let newChars = 0;
       for (const m of pageMutations) {
         for (const node of m.addedNodes) {
           newChars += node.textContent?.length ?? 0;
         }
       }
-      if (newChars <= 200) return;
-      _debouncedRescan();
+
+      if (newChars < LAZY_LOAD_MIN_CHARS) return; // UI noise — ignore
+
+      if (newChars >= SPA_THRESHOLD) {
+        // PATH B: large content swap → full rescan
+        _debouncedRescan();
+      } else {
+        // PATH A: modest new content → incremental highlight
+        _debouncedLazyHighlight();
+      }
     });
+
     _spaObserver.observe(document.body, { childList: true, subtree: true });
   } catch (err) {
     console.warn('[VocaSpot] unexpected error in main — extension did not crash the page:', err);
