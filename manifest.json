@@ -1,12 +1,13 @@
 {
   "manifest_version": 3,
-  "name": "VocaSpot - CEFR Vocabulary Highlighter",
-  "version": "1.0.2",
+  "name": "VocaSpot__mod",
+  "version": "0.0.1",
   "description": "Highlights words on news pages based on your CEFR level and shows context-aware definitions.",
   "homepage_url": "https://vocaspot.grapeslabs.dev/",
   "permissions": [
     "storage",
-    "activeTab"
+    "activeTab",
+    "unlimitedStorage"
   ],
   "host_permissions": [
     "https://api.dictionaryapi.dev/*"
